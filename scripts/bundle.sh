@@ -11,8 +11,11 @@ swift build -c release
 
 echo "Assembling ${BUNDLE_DIR}..."
 rm -rf "${BUNDLE_DIR}"
-mkdir -p "${MACOS_DIR}"
+mkdir -p "${MACOS_DIR}" "${CONTENTS_DIR}/Resources"
 cp ".build/release/${APP_NAME}" "${MACOS_DIR}/${APP_NAME}"
+if [ -f "Resources/AppIcon.icns" ]; then
+    cp "Resources/AppIcon.icns" "${CONTENTS_DIR}/Resources/AppIcon.icns"
+fi
 
 cat > "${CONTENTS_DIR}/Info.plist" << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -23,6 +26,8 @@ cat > "${CONTENTS_DIR}/Info.plist" << 'EOF'
     <string>en</string>
     <key>CFBundleExecutable</key>
     <string>PowerLevel</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>com.powerlevel.app</string>
     <key>CFBundleInfoDictionaryVersion</key>
