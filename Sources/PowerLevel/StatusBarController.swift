@@ -85,16 +85,29 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         guard current != lastRendered else { return }
         lastRendered = current
 
+        let onlineKinds = DeviceKind.allCases.filter { kind in
+            guard let state = devices[kind] else { return false }
+            return state.isOnline && state.percentage != nil
+        }
+
+        guard !onlineKinds.isEmpty else {
+            statusItem.isVisible = false
+            return
+        }
+
+        statusItem.isVisible = true
+
         guard let button = statusItem.button else { return }
         let result = NSMutableAttributedString()
 
-        for (index, kind) in DeviceKind.allCases.enumerated() {
+        for (index, kind) in onlineKinds.enumerated() {
             if index > 0 {
                 result.append(NSAttributedString(string: "   ", attributes: [.font: textFont]))
             }
 
-            let state = devices[kind] ?? .offline(kind)
-            let isLow = (state.percentage ?? 100) <= 20 && state.charging != .charging
+            let state = devices[kind]!
+            let pct = state.percentage!
+            let isLow = pct <= 20 && state.charging != .charging
 
             if let icon = cachedIcons[kind] {
                 let attachment = NSTextAttachment()
@@ -111,19 +124,11 @@ final class StatusBarController: NSObject, NSMenuDelegate {
                 result.append(NSAttributedString(attachment: attachment))
             }
 
-            let labelText: String = if let pct = state.percentage {
-                " \(pct)%"
-            } else {
-                " —"
-            }
-
             var attrs: [NSAttributedString.Key: Any] = [.font: textFont]
             if isLow {
                 attrs[.foregroundColor] = NSColor.systemRed
-            } else if !state.isOnline && state.percentage == nil {
-                attrs[.foregroundColor] = NSColor.tertiaryLabelColor
             }
-            result.append(NSAttributedString(string: labelText, attributes: attrs))
+            result.append(NSAttributedString(string: " \(pct)%", attributes: attrs))
         }
 
         button.attributedTitle = result

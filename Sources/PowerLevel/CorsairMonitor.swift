@@ -24,6 +24,10 @@ final class CorsairMonitor {
 
     var onUpdate: ((DeviceBattery) -> Void)?
 
+    var hasOnlineDevice: Bool {
+        battery.isOnline && battery.percentage != nil
+    }
+
     init() {
         manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
         let matching: [String: Any] = [
@@ -131,9 +135,22 @@ final class CorsairMonitor {
     }
 
     private func handleReport(_ bytes: UnsafeBufferPointer<UInt8>) {
-        guard bytes.count >= 6 else { return }
-        // Bragi response from subdevice 1: [0x01, 0x01, cmd, ...]
-        guard bytes[0] == 0x01, bytes[1] == 0x01 else { return }
+        guard bytes.count >= 6, bytes[0] == 0x01 else { return }
+
+        // Dongle (subdevice 0) async wireless connection state event: [0x01, 0x00, 0x01, 0x36, state]
+        if bytes[1] == 0x00 && bytes[2] == 0x01 && bytes[3] == 0x36 {
+            let connected = (bytes[4] & 0x02) != 0
+            if connected {
+                refresh()
+            } else if battery.isOnline {
+                battery = .offline(.headset, name: "CORSAIR HS80 MAX")
+                onUpdate?(battery)
+            }
+            return
+        }
+
+        // Bragi response/event from subdevice 1 (wireless headset): [0x01, 0x01, cmd, ...]
+        guard bytes[1] == 0x01 else { return }
 
         let cmd = bytes[2]
 

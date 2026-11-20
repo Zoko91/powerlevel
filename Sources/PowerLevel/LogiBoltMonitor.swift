@@ -28,6 +28,10 @@ final class LogiBoltMonitor {
 
     var onUpdate: (([DeviceKind: DeviceBattery]) -> Void)?
 
+    var hasOnlineDevice: Bool {
+        batteries.values.contains { $0.isOnline && $0.percentage != nil }
+    }
+
     init() {
         manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
         let matching: [String: Any] = [
@@ -222,12 +226,30 @@ final class LogiBoltMonitor {
             return
         }
 
-        // 2. Device connection notification (short report 0x10, subID 0x41)
+        // 2. Device connection / disconnection notification (short report 0x10, subID 0x41)
         if reportID == 0x10 && bytes[2] == 0x41 && (1...6).contains(slot) {
             if let info = slots[slot] {
                 let linkLost = (bytes[4] & 0x40) != 0
-                if !linkLost {
+                if linkLost {
+                    batteries[info.kind] = .offline(info.kind, name: info.name)
+                    onUpdate?(batteries)
+                } else {
                     queryBattery(slot: slot, featureIndex: info.batteryFeatureIndex)
+                }
+            } else {
+                // New or previously undiscovered slot just connected
+                discoverPairedSlots()
+            }
+            return
+        }
+
+        // 2b. HID++ 1.0 error (0x8F) for a known slot (e.g. 0x09 = ERR_RESOURCE_ERROR when device is off)
+        if reportID == 0x10 && bytes[2] == 0x8F, let info = slots[slot] {
+            let errCode = bytes[5]
+            if errCode == 0x09 || errCode == 0x04 {
+                if batteries[info.kind]?.isOnline == true {
+                    batteries[info.kind] = .offline(info.kind, name: info.name)
+                    onUpdate?(batteries)
                 }
             }
             return
