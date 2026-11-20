@@ -20,6 +20,8 @@ final class CorsairMonitor {
     private var reportBuffer: UnsafeMutableBufferPointer<UInt8>?
 
     private var pendingQuery: PendingQuery?
+    private var delayedRefreshWorkItem: DispatchWorkItem?
+    private var zeroRetryCount = 0
     private var battery = DeviceBattery.offline(.headset, name: "CORSAIR HS80 MAX")
 
     var onUpdate: ((DeviceBattery) -> Void)?
@@ -59,6 +61,7 @@ final class CorsairMonitor {
     }
 
     func stop() {
+        cancelDelayedRefresh()
         if let dev = device {
             IOHIDDeviceClose(dev, IOOptionBits(kIOHIDOptionsTypeNone))
             device = nil
@@ -70,8 +73,25 @@ final class CorsairMonitor {
 
     func refresh() {
         guard device != nil else { return }
+        cancelDelayedRefresh()
         pendingQuery = .batteryLevel
         sendGetProperty(Self.propBatteryLevel)
+    }
+
+    private func scheduleRefresh(after seconds: TimeInterval) {
+        cancelDelayedRefresh()
+        let item = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                self?.refresh()
+            }
+        }
+        delayedRefreshWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: item)
+    }
+
+    private func cancelDelayedRefresh() {
+        delayedRefreshWorkItem?.cancel()
+        delayedRefreshWorkItem = nil
     }
 
     private func attachDevice(_ dev: IOHIDDevice) {
@@ -105,11 +125,13 @@ final class CorsairMonitor {
 
     private func detachDevice(_ dev: IOHIDDevice) {
         guard let current = device, CFEqual(current, dev) else { return }
+        cancelDelayedRefresh()
         IOHIDDeviceClose(current, IOOptionBits(kIOHIDOptionsTypeNone))
         device = nil
         reportBuffer?.deallocate()
         reportBuffer = nil
         pendingQuery = nil
+        zeroRetryCount = 0
 
         battery = .offline(.headset, name: "CORSAIR HS80 MAX")
         onUpdate?(battery)
@@ -141,10 +163,16 @@ final class CorsairMonitor {
         if bytes[1] == 0x00 && bytes[2] == 0x01 && bytes[3] == 0x36 {
             let connected = (bytes[4] & 0x02) != 0
             if connected {
-                refresh()
-            } else if battery.isOnline {
-                battery = .offline(.headset, name: "CORSAIR HS80 MAX")
-                onUpdate?(battery)
+                // Give the headset firmware ~2s to populate its battery reading on the dongle
+                zeroRetryCount = 0
+                scheduleRefresh(after: 2.0)
+            } else {
+                cancelDelayedRefresh()
+                zeroRetryCount = 0
+                if battery.isOnline {
+                    battery = .offline(.headset, name: "CORSAIR HS80 MAX")
+                    onUpdate?(battery)
+                }
             }
             return
         }
@@ -160,6 +188,12 @@ final class CorsairMonitor {
             if propID == Self.propBatteryLevel {
                 let raw = Int(bytes[4]) | (Int(bytes[5]) << 8)
                 let pct = max(0, min(100, (raw + 5) / 10))
+                if pct == 0 && battery.percentage == nil && zeroRetryCount < 3 {
+                    zeroRetryCount += 1
+                    scheduleRefresh(after: 2.0)
+                    return
+                }
+                zeroRetryCount = 0
                 battery.percentage = pct
                 battery.isOnline = true
                 battery.lastUpdated = Date()
@@ -179,6 +213,8 @@ final class CorsairMonitor {
         let status = bytes[3]
         guard status == 0x00 else {
             // Headset is off or disconnected from receiver
+            cancelDelayedRefresh()
+            zeroRetryCount = 0
             battery = .offline(.headset, name: "CORSAIR HS80 MAX")
             onUpdate?(battery)
             return
@@ -188,6 +224,13 @@ final class CorsairMonitor {
         case .batteryLevel:
             let raw = Int(bytes[4]) | (Int(bytes[5]) << 8)
             let pct = max(0, min(100, (raw + 5) / 10))
+            // Right after power-on, the dongle can briefly report 0% before the headset syncs
+            if pct == 0 && battery.percentage == nil && zeroRetryCount < 3 {
+                zeroRetryCount += 1
+                scheduleRefresh(after: 2.0)
+                return
+            }
+            zeroRetryCount = 0
             battery.percentage = pct
             battery.isOnline = true
             battery.lastUpdated = Date()
