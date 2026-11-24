@@ -7,8 +7,8 @@ final class LogiBoltMonitor {
     private static let productID = 0xC548 // Logi Bolt Receiver
     private static let usagePage = 0xFF00
 
-    private static let swIDGetFeature: UInt8 = 0x0A
-    private static let swIDGetBattery: UInt8 = 0x0B
+    private static let swIDGetFeature: UInt8 = 0x0D
+    private static let swIDGetBattery: UInt8 = 0x0E
 
     private struct SlotInfo {
         var kind: DeviceKind
@@ -21,6 +21,8 @@ final class LogiBoltMonitor {
     private var reportBuffer: UnsafeMutableBufferPointer<UInt8>?
 
     private var slots: [UInt8: SlotInfo] = [:]
+    private var pendingFeatureLookup: Set<UInt8> = []
+    private var pendingBatteryQuery: Set<UInt8> = []
     private var batteries: [DeviceKind: DeviceBattery] = [
         .mouse: .offline(.mouse, name: "Logitech Mouse"),
         .keyboard: .offline(.keyboard, name: "Logitech Keyboard")
@@ -110,6 +112,8 @@ final class LogiBoltMonitor {
         IOHIDDeviceScheduleWithRunLoop(dev, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
 
         slots.removeAll()
+        pendingFeatureLookup.removeAll()
+        pendingBatteryQuery.removeAll()
         discoverPairedSlots()
     }
 
@@ -120,6 +124,8 @@ final class LogiBoltMonitor {
         reportBuffer?.deallocate()
         reportBuffer = nil
         slots.removeAll()
+        pendingFeatureLookup.removeAll()
+        pendingBatteryQuery.removeAll()
 
         batteries[.mouse] = .offline(.mouse, name: batteries[.mouse]?.name)
         batteries[.keyboard] = .offline(.keyboard, name: batteries[.keyboard]?.name)
@@ -137,9 +143,11 @@ final class LogiBoltMonitor {
     private func queryBattery(slot: UInt8, featureIndex: UInt8?) {
         if let featureIndex {
             // Unified Battery (0x1004) function 1: get_status
+            pendingBatteryQuery.insert(slot)
             sendLong([0x11, slot, featureIndex, (1 << 4) | Self.swIDGetBattery])
         } else {
             // Root (0x0000) function 0: getFeature(0x1004 = Unified Battery)
+            pendingFeatureLookup.insert(slot)
             sendLong([0x11, slot, 0x00, Self.swIDGetFeature, 0x10, 0x04])
         }
     }
@@ -262,8 +270,12 @@ final class LogiBoltMonitor {
         let swID = funcAndSw & 0x0F
         let fn = (funcAndSw & 0xF0) >> 4
 
-        // Root GetFeature(0x1004) response
-        if featureIndex == 0x00 && swID == Self.swIDGetFeature {
+        // Root GetFeature(0x1004) response — only accept when we actually requested it
+        // (avoids collisions when Logi Options+ queries Root 0x00 for unrelated features)
+        if featureIndex == 0x00 && fn == 0 && swID == Self.swIDGetFeature {
+            guard pendingFeatureLookup.remove(slot) != nil, info.batteryFeatureIndex == nil else {
+                return
+            }
             let discoveredIndex = bytes[4]
             if discoveredIndex != 0 {
                 info.batteryFeatureIndex = discoveredIndex
@@ -273,11 +285,26 @@ final class LogiBoltMonitor {
             return
         }
 
-        // Unified Battery (0x1004) response (fn 1, swID 0x0B) or async event (fn 0, swID 0x00)
-        if let batIdx = info.batteryFeatureIndex, featureIndex == batIdx,
-           (fn == 1 && swID == Self.swIDGetBattery) || (fn == 0 && swID == 0x00) {
-            let pct = max(0, min(100, Int(bytes[4])))
-            let charging: ChargingState = switch bytes[6] {
+        // Unified Battery (0x1004) response (fn 1, swID 0x0E) or async event (fn 0, swID 0x00)
+        if let batIdx = info.batteryFeatureIndex, featureIndex == batIdx {
+            let isOurReply = (fn == 1 && swID == Self.swIDGetBattery && pendingBatteryQuery.remove(slot) != nil)
+            let isAsyncEvent = (fn == 0 && swID == 0x00)
+            guard isOurReply || isAsyncEvent else { return }
+
+            let rawPct = Int(bytes[4])
+            let levelMask = bytes[5]
+            let rawCharging = bytes[6]
+
+            // Validate Unified Battery payload (levelMask is a single bit in 1|2|4|8, charging in 0...4)
+            let validLevel = levelMask == 0x01 || levelMask == 0x02 || levelMask == 0x04 || levelMask == 0x08
+            guard rawPct <= 100, rawCharging <= 4, validLevel else {
+                // Feature index may have been misidentified; re-discover on next refresh
+                info.batteryFeatureIndex = nil
+                slots[slot] = info
+                return
+            }
+
+            let charging: ChargingState = switch rawCharging {
             case 0: .discharging
             case 1, 2: .charging
             case 3: .full
@@ -287,7 +314,7 @@ final class LogiBoltMonitor {
             batteries[info.kind] = DeviceBattery(
                 kind: info.kind,
                 name: info.name,
-                percentage: pct,
+                percentage: rawPct,
                 charging: charging,
                 isOnline: true,
                 lastUpdated: Date()
